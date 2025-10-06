@@ -20,10 +20,13 @@ import os
 import tempfile
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Optional, Union
+from typing import TYPE_CHECKING, Any, Optional, Union, List
+import json
 
 import faiss
 from llama_index.core import Settings, SimpleDirectoryReader, VectorStoreIndex
+from llama_index.core.node_parser import HTMLNodeParser
+from llama_index.core.node_parser import MarkdownNodeParser
 from llama_index.core.llms.utils import resolve_llm
 from llama_index.core.readers.base import BaseReader
 from llama_index.core.schema import Document, TextNode
@@ -32,6 +35,10 @@ from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 from llama_index.vector_stores.faiss import FaissVectorStore
 from llama_index.vector_stores.postgres import PGVectorStore
 from sentence_transformers import SentenceTransformer
+from llama_index.core.callbacks.base import CallbackManager
+from llama_index.core.schema import BaseNode, MetadataMode, TextNode
+from llama_index.core.bridge.pydantic import Field
+from llama_index.core.node_parser.node_utils import build_nodes_from_splits
 
 from lightspeed_rag_content.metadata_processor import MetadataProcessor
 
@@ -39,6 +46,116 @@ if TYPE_CHECKING:
     from llama_index.core.vector_stores.types import BasePydanticVectorStore
 
 LOG = logging.getLogger(__name__)
+HEADER_TAGS = ['h1', 'h2']
+CONTENT_TAGS = ['p', 'li', 'b', 'i', 'u', 'h3', 'h4', 'h5', 'h6', 'table', 'o1', 'pre', 'code']
+
+class CustomHTMLNodeParser(HTMLNodeParser):
+    header_tags: List[str] = Field(
+        default=HEADER_TAGS, description="HTML tags to extract text from."
+    )
+    content_tags: List[str] = Field(
+        default=CONTENT_TAGS, description="HTML tags to extract text from."
+    )
+    @classmethod
+    def from_defaults(
+        cls,
+        include_metadata: bool = True,
+        include_prev_next_rel: bool = True,
+        callback_manager: Optional[CallbackManager] = None,
+        header_tags: Optional[List[str]] = HEADER_TAGS,
+        content_tags: Optional[List[str]] = CONTENT_TAGS
+    ) -> "CustomHTMLNodeParser":
+        callback_manager = callback_manager or CallbackManager([])
+        return cls(
+            include_metadata=include_metadata,
+            include_prev_next_rel=include_prev_next_rel,
+            callback_manager=callback_manager,
+            header_tags=header_tags,
+            content_tags=content_tags,
+        )
+    
+    @classmethod
+    def class_name(cls) -> str:
+        """Get class name."""
+        return "CustomHTMLNodeParser"
+
+    def get_nodes_from_node(self, node: BaseNode) -> List[TextNode]:
+        """Get nodes from document."""
+        try:
+            from bs4 import BeautifulSoup
+        except ImportError:
+            raise ImportError("bs4 is required to read HTML files.")
+
+        text = node.get_content(metadata_mode=MetadataMode.NONE)
+        soup = BeautifulSoup(text, "html.parser")
+        html_nodes = []
+        current_section = ""
+        all_elements = soup.find_all(self.header_tags + self.content_tags)
+        previous_header = None
+
+        for element in all_elements:
+            element_text = self._extract_text_from_tag(element)
+            
+            if not element_text:
+                continue
+
+            # A. If the element is a Header, start a new group
+            if element.name in self.header_tags:
+                if current_section != "":
+                    html_nodes.append(
+                    self._build_node_from_split(
+                        current_section.strip(), node, {"tag": previous_header}
+                    ))
+                previous_header = element.name
+                current_section = f"{element_text.strip()}\n"
+
+                    
+            # B. If the element is a Content tag, append to the current group
+            elif element.name in self.content_tags:
+                # Append the text to the list under the last seen header
+                current_section += f"{element_text.strip()}\n"
+        if current_section != "":
+            html_nodes.append(
+            self._build_node_from_split(
+                current_section.strip(), node, {"tag": previous_header}
+            ))
+        return html_nodes
+    
+    def _extract_text_from_tag(
+        self, tag: Union["Tag", "NavigableString", "PageElement"]
+    ) -> str:
+        from bs4 import NavigableString, Tag, PageElement
+
+        texts = []
+        if isinstance(tag, Tag):
+            for elem in tag.children:
+                if isinstance(elem, NavigableString):
+                    if elem.strip():
+                        texts.append(elem.strip())
+                elif isinstance(elem, Tag):
+                    if elem.name in self.content_tags + self.header_tags:
+                        continue
+                    else:
+                        texts.append(elem.get_text().strip())
+                elif isinstance(elem, PageElement):
+                    texts.append(elem.get_text().strip())
+        else:
+            texts.append(tag.get_text().strip())
+        return "\n".join(texts)
+    
+    def _build_node_from_split(
+        self,
+        text_split: str,
+        node: BaseNode,
+        metadata: dict,
+    ) -> TextNode:
+        """Build node from single text split."""
+        node = build_nodes_from_splits([text_split], node, id_func=self.id_func)[0]
+
+        if self.include_metadata:
+            node.metadata = {**node.metadata, **metadata}
+
+        return node
 
 
 class _Config:
@@ -95,7 +212,9 @@ class _BaseDB:
 
     @classmethod
     def _split_and_filter(cls, docs: list[Document]) -> list[TextNode]:
-        nodes = Settings.text_splitter.get_nodes_from_documents(docs)
+        #nodes = Settings.text_splitter.get_nodes_from_documents(docs)
+        nodes = list(CustomHTMLNodeParser().get_nodes_from_documents(docs))
+        #nodes = list(MarkdownNodeParser().get_nodes_from_documents(docs))
         valid_nodes = cls._filter_out_invalid_nodes(nodes)
         return valid_nodes
 
@@ -348,6 +467,31 @@ vector_dbs:
                 )
                 for doc in docs
             )
+        dirname = Path("/app-root/llama_stack_vector_db/html-h2")
+        print(len(self.documents))
+        try:
+            dirname.mkdir()
+        except Exception:
+            pass
+        min_i = max_i = max = sum = 0
+        min = len(self.documents[0]['content'].split())
+        for i,d in enumerate(self.documents):
+            l = len(d['content'].split())
+            if l < min:
+                min = l
+                min_i = i
+            if l > max:
+                max = l
+                max_i = i
+            sum = sum + l
+            with open("/app-root/llama_stack_vector_db/html-h2/%s.json" % i, "w") as f:
+                json.dump(d, f, indent=4)
+        print("------writting of documents ended--------")
+        avg = sum / len(self.documents)
+        print("avg len = %s" % avg)
+        print("min = %s, and the index is %s" % (min, min_i))
+        print("max = %s, and the index is %s" % (max, max_i))
+        
 
     def save(
         self,
@@ -478,7 +622,7 @@ class DocumentProcessor:
                 # Optionally drop unreachable URLs
                 if unreachable_action == "drop":
                     docs = reachable_docs
-
+#        docs = list(MarkdownNodeParser().get_nodes_from_documents(docs))
         self.db.add_docs(docs)
 
         # Count embedded files and unreachable nodes
